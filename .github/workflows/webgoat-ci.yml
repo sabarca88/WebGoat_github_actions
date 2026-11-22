@@ -1,0 +1,27 @@
+name: WebGoat CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Descargar código del repositorio
+      uses: actions/checkout@v4
+
+    - name: Configurar Java (JDK 25 LTS Microsoft)
+      uses: actions/setup-java@v4
+      with:
+        java-version: '25'
+        distribution: 'microsoft'
+        cache: maven
+
+    - name: Dar permisos a Maven Wrapper y compilar
+      run: |
+        chmod +x mvnw
+        ./mvnw clean test-compile
