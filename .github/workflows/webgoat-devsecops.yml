@@ -25,7 +25,11 @@ jobs:
         with:
           java-version: '25'
           distribution: 'microsoft'
-          cache: maven
+
+      - name: 2b. Configurar Maven
+        uses: stCarolas/setup-maven@v5
+        with:
+          maven-version: 3.9.9
 
       - name: 3. Compilar con Maven
         run: mvn clean package -DskipTests
@@ -34,20 +38,16 @@ jobs:
         run: mvn org.cyclonedx:cyclonedx-maven-plugin:makeAggregateBom
 
       - name: 5. Subir artefacto SBOM
+        if: ${{ !env.ACT }}
         uses: actions/upload-artifact@v7
         with:
           name: webgoat-sbom-cyclonedx
           path: "**/target/bom.*"
 
       - name: 6. Ejecutar SCA (Análisis de dependencias con Trivy)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y wget apt-transport-https gnupg
-          wget -qO - https://github.io | gpg --dearmor | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
-          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://github.io generic main" | sudo tee -a /etc/apt/sources.list.d/trivy.list
-          sudo apt-get update
-          sudo apt-get install -y trivy
-          trivy fs --scanners vuln --severity HIGH,CRITICAL --format table .
+        uses: docker://aquasec/trivy:latest
+        with:
+          args: fs --scanners vuln --severity HIGH,CRITICAL --format table .
 
   sast-codeql:
     name: SAST (CodeQL Java)
