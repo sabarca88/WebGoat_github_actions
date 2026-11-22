@@ -1,0 +1,75 @@
+name: WebGoat DevSecOps (Build, SAST, SCA & SBOM)
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  build-sca-sbom:
+    name: Build Maven, SCA & SBOM
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. Checkout del código
+        uses: actions/checkout@v6
+
+      - name: 2. Configurar Java (JDK 25 Microsoft)
+        uses: actions/setup-java@v5
+        with:
+          java-version: '25'
+          distribution: 'microsoft'
+          cache: maven
+
+      - name: 3. Compilar con Maven
+        run: |
+          chmod +x mvnw
+          ./mvnw clean package -DskipTests
+
+      - name: 4. Generar SBOM (CycloneDX)
+        run: ./mvnw org.cyclonedx:cyclonedx-maven-plugin:makeAggregateBom
+
+      - name: 5. Subir artefacto SBOM
+        uses: actions/upload-artifact@v7
+        with:
+          name: webgoat-sbom-cyclonedx
+          path: "**/target/bom.*"
+
+      - name: 6. Ejecutar SCA (Análisis de dependencias con Trivy)
+        run: |
+          curl -sfL https://githubusercontent.com | sh -s -- -b /usr/local/bin
+          trivy fs --scanners vuln --severity HIGH,CRITICAL --format table .
+
+  sast-codeql:
+    name: SAST (CodeQL Java)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. Checkout del código
+        uses: actions/checkout@v6
+
+      - name: 2. Configurar Java para CodeQL
+        uses: actions/setup-java@v5
+        with:
+          java-version: '25'
+          distribution: 'microsoft'
+
+      - name: 3. Inicializar CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: java-kotlin
+          queries: security-extended
+
+      - name: 4. Compilar código para análisis SAST
+        run: |
+          chmod +x mvnw
+          ./mvnw clean compile -DskipTests
+
+      - name: 5. Ejecutar análisis SAST y subir resultados
+        uses: github/codeql-action/analyze@v4
