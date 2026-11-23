@@ -1,4 +1,10 @@
-name: WebGoat DevSecOps (Build, SAST, SCA & SBOM)
+name: WebGoat DevSecOps Pipeline
+
+# Arquitectura:
+# - Ejecución secuencial con dependencias, evitar ejecución en paralelo sin dependencias 
+# - Compilar el código 1 sola vez
+# - Shift-Left" (de lo más rápido y barato a lo más lento y profundo)
+# - Reportes unificados en GitHub (SARIF)
 
 on:
   push:
@@ -12,65 +18,252 @@ permissions:
   actions: read
 
 jobs:
-  build-sca-sbom:
-    name: Build Maven, SCA & SBOM
+
+  # ==========================================$
+  # FASE 0: Copiada de https://docs.github.com/es/actions/get-started/quickstart 
+  # ==========================================$
+  Explore-GitHub-Actions:
     runs-on: ubuntu-latest
-
     steps:
-      - name: 1. Checkout del código
+      - run: echo "🎉 The job was automatically triggered by a ${{ github.event_name }} event."
+      - run: echo "🐧 This job is now running on a ${{ runner.os }} server hosted by GitHub!"
+      - run: echo "🔎 The name of your branch is ${{ github.ref }} and your repository is ${{ github.repository }}."
+      - name: Check out repository code
         uses: actions/checkout@v6
+      - run: echo "💡 The ${{ github.repository }} repository has been cloned to the runner."
+      - run: echo "🖥️ The workflow is now ready to test your code on the runner."
+      - name: List files in the repository
+        run: |
+          ls ${{ github.workspace }}
+      - run: echo "🍏 This job's status is ${{ job.status }}."
 
-      - name: 2. Configurar Java (JDK 25 Microsoft)
-        uses: actions/setup-java@v5
+  # ==========================================
+  # FASE 1: CONTROLES RÁPIDOS (Fail-Fast)
+  # 1. Escaneo de secretos (Gitleaks/TruffleHog).
+  # 2. Seguridad de Infraestructura como Código / IaC (Checkov).
+  # Por qué primero: Si alguien subió una contraseña o un Dockerfile crítico, 
+  # falla en segundos sin gastar minutos compilando Java.
+  # ==========================================
+  secret-scanning:
+    name: FASE 1 - 1. Secretos (Gitleaks)
+    needs: Explore-GitHub-Actions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Escanear secretos en código e historial
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  iac-security:
+    name: FASE 1 - 2. IaC & Dockerfiles (Checkov)
+    needs: Explore-GitHub-Actions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Analizar infraestructura con Checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          soft_fail: true
+          # Reporta las vulnerabilidades en la pestaña Security de GitHub sin romper el pipeline
+          output_format: sarif
+          output_file_path: checkov.sarif
+
+      - name: Subir resultados a GitHub Security
+        if: always() && !env.ACT
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: checkov.sarif
+
+      - name: Guardar Checkov SARIF para informe final
+        if: always() && !env.ACT
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-reports
+          path: checkov.sarif
+
+  # ==========================================
+  # FASE 2: BUILD & GENERACIÓN DE SBOM
+  # Compilar con Maven una sola vez, generar el .jar y el SBOM, 
+  # y los compartirlo con los siguientes jobs
+  # ==========================================
+  build-and-sbom:
+    name: FASE 2. Build Maven & SBOM
+    needs: [secret-scanning, iac-security] # Solo compila si pasa la Fase 1
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-java@v5
         with:
           java-version: '25'
           distribution: 'microsoft'
+          cache: 'maven' 
+          # Acelera las compilaciones - La primera vez que corre el workflow, 
+          # descarga las dependencias y al final comprime la carpeta ~/.m2/repository 
+          # en los servidores de caché de GitHub.
+          # GitHub vincula esa caché a un hash de tu archivo pom.xml. 
+          # Si no se modifican las dependencias, se reutiliza la caché;
+          # si se añade o actualiza una librería en el pom.xml, 
+          # actualiza la caché automáticamente.
 
-      - name: 2b. Configurar Maven
-        uses: stCarolas/setup-maven@v5
-        with:
-          maven-version: 3.9.9
+      - name: Compilar y generar SBOM CycloneDX
+        run: mvn clean package org.cyclonedx:cyclonedx-maven-plugin:makeAggregateBom -DskipTests
 
-      - name: 3. Compilar con Maven
-        run: mvn clean package -DskipTests
-
-      - name: 4. Generar SBOM (CycloneDX)
-        run: mvn org.cyclonedx:cyclonedx-maven-plugin:makeAggregateBom
-
-      - name: 5. Subir artefacto SBOM
-        if: ${{ !env.ACT }}
+      - name: Guardar target/ para los análisis de seguridad
+        if: ${{ !env.ACT }} # Uso de act para pruebas locales
         uses: actions/upload-artifact@v7
         with:
-          name: webgoat-sbom-cyclonedx
-          path: "**/target/bom.*"
+          name: build-artifacts
+          path: |
+            target/bom.json
+            target/*.jar
+          retention-days: 10
 
-      - name: 6. Ejecutar SCA sobre el SBOM (Trivy)
-        uses: docker://aquasec/trivy:latest
-        with:
-          args: sbom --severity HIGH,CRITICAL --format table target/bom.json
-
+  # ==========================================
+  # FASE 3: ANÁLISIS PROFUNDO (SAST & SCA)
+  # ==========================================
   sast-codeql:
-    name: SAST (CodeQL Java)
+    name: FASE 3 - 1. SAST (CodeQL)
+    needs: build-and-sbom
     runs-on: ubuntu-latest
-
     steps:
-      - name: 1. Checkout del código
-        uses: actions/checkout@v6
-
-      - name: 2. Configurar Java para CodeQL
-        uses: actions/setup-java@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-java@v5
         with:
           java-version: '25'
           distribution: 'microsoft'
-
-      - name: 3. Inicializar CodeQL
-        uses: github/codeql-action/init@v4
+          cache: 'maven'
+      - uses: github/codeql-action/init@v4
         with:
           languages: java-kotlin
           queries: security-extended
+      - run: mvn clean compile -DskipTests
 
-      - name: 4. Compilar código para análisis SAST
-        run: mvn clean compile -DskipTests
-
-      - name: 5. Ejecutar análisis SAST y subir resultados
+      - name: Ejecutar análisis CodeQL y exportar SARIF
         uses: github/codeql-action/analyze@v4
+        with:
+          output: codeql-results
+
+      - name: Guardar CodeQL SARIF para informe final
+        if: always() && !env.ACT
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-reports
+          path: codeql-results/*.sarif
+
+  sast-sonarqube:
+    name: FASE 3 - 2. SAST & Quality Gate (SonarQube)
+    needs: build-and-sbom
+    environment: Webgoat_actions # Vincula secretos del entorno configurado en settings
+    runs-on: ubuntu-latest
+    continue-on-error: true # Si falla la conexión o el análisis, el pipeline continúa en verde
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-java@v5
+        with:
+          java-version: '25'
+          distribution: 'microsoft'
+          cache: 'maven'
+      - name: Análisis SonarQube
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: >
+          mvn -B verify org.sonarsource.scanner.maven:sonar-maven-plugin:sonar
+          -Dsonar.projectKey=webgoat
+          -DskipTests
+
+  sca-analysis:
+    name: FASE 3 - 3. SCA (Trivy + Dependency-Check)
+    needs: build-and-sbom
+    environment: Webgoat_actions # Vincula secretos del entorno configurado en settings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Descargar SBOM generado
+        if: ${{ !env.ACT }}
+        uses: actions/download-artifact@v5
+        with:
+          name: build-artifacts
+          path: target/
+
+      - name: Trivy SCA (Salida SARIF para GitHub)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'sbom'
+          scan-ref: 'target/bom.json'
+          format: 'sarif'
+          output: 'trivy-sca.sarif'
+          severity: 'HIGH,CRITICAL'
+
+      - name: Subir Trivy SARIF a GitHub Security
+        if: always() && !env.ACT
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: 'trivy-sca.sarif'
+
+      - name: OWASP Dependency-Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: 'WebGoat'
+          path: '.'
+          format: 'SARIF'
+          args: >
+            --failOnCVSS 11
+           # Como WebGoat es una aplicación deliberadamente vulnerable, existen fallos
+           # he puesto --failOnCVSS 7 (falla si hay vulnerabilidades altas/críticas). 
+           # Para no detener el build, cambio ese valor a 11.
+        env:
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+
+      - name: Subir Dependency-Check SARIF a GitHub Security
+        if: always() && !env.ACT
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: 'reports/dependency-check-report.sarif'
+
+      - name: Guardar SCA SARIFs para informe final
+        if: always() && !env.ACT
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-reports
+          path: |
+            trivy-sca.sarif
+            reports/dependency-check-report.sarif
+
+  # ==========================================
+  # FASE 4: INFORME CONSOLIDADO EXPORTABLE
+  # ==========================================
+  generate-security-report:
+    name: FASE 4. Generar Informe Exportable (HTML)
+    needs: [iac-security, sca-analysis, sast-codeql]
+    if: always() && !env.ACT
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar todos los archivos SARIF
+        uses: actions/download-artifact@v4
+        with:
+          name: sarif-reports
+          path: all-sarifs/
+
+      - name: Convertir SARIF a informe HTML unificado
+        run: |
+          npm install -g @microsoft/sarif-multitool sarif-to-html
+          # Fusiona todos los SARIF de distintas herramientas en un solo archivo
+          npx @microsoft/sarif-multitool merge all-sarifs/*.sarif --output-file consolidated.sarif --force
+          # Convierte el SARIF unificado en un informe HTML visual
+          npx sarif-to-html consolidated.sarif -o security-report.html
+
+      - name: Subir Informe Final Descargable
+        uses: actions/upload-artifact@v4
+        with:
+          name: Informe-Seguridad-WebGoat
+          path: |
+            consolidated.sarif
+            security-report.html
+
