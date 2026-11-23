@@ -114,7 +114,7 @@ jobs:
 
       - name: Guardar target/ para los análisis de seguridad
         if: ${{ !env.ACT }} # Uso de act para pruebas locales
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: build-artifacts
           path: |
@@ -187,7 +187,7 @@ jobs:
       - uses: actions/checkout@v6
       - name: Descargar SBOM generado
         if: ${{ !env.ACT }}
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v4
         with:
           name: build-artifacts
           path: target/
@@ -242,7 +242,7 @@ jobs:
   generate-security-report:
     name: FASE 4. Generar Informe Exportable (HTML)
     needs: [iac-security, sca-analysis, sast-codeql]
-    if: always() && !env.ACT
+    if: always() && github.actor != 'nektos/act'
     runs-on: ubuntu-latest
     steps:
       - name: Descargar todos los archivos SARIF
@@ -253,17 +253,73 @@ jobs:
 
       - name: Convertir SARIF a informe HTML unificado
         run: |
-          npm install -g @microsoft/sarif-multitool sarif-to-html
-          # Fusiona todos los SARIF de distintas herramientas en un solo archivo
-          npx @microsoft/sarif-multitool merge all-sarifs/*.sarif --output-file consolidated.sarif --force
-          # Convierte el SARIF unificado en un informe HTML visual
-          npx sarif-to-html consolidated.sarif -o security-report.html
+          mkdir -p final-report
+          npx --yes @microsoft/sarif-multitool merge all-sarifs/**/*.sarif \
+            --output-file consolidated.sarif \
+            --output-directory final-report \
+            --log ForceOverwrite \
+            --merge-empty-logs
+
+          cat << 'EOF' > make_html.py
+          import json, html
+
+          with open("final-report/consolidated.sarif", "r", encoding="utf-8") as f:
+              data = json.load(f)
+
+          rows = []
+          counts = {"error": 0, "warning": 0, "note": 0}
+
+          for run in data.get("runs", []):
+              tool = run.get("tool", {}).get("driver", {}).get("name", "Desconocida")
+              for res in run.get("results", []):
+                  level = res.get("level", "warning")
+                  counts[level] = counts.get(level, 0) + 1
+                  rule_id = html.escape(str(res.get("ruleId", "N/A")))
+                  msg = html.escape(str(res.get("message", {}).get("text", "")))
+                  locs = res.get("locations", [])
+                  file_path = "N/A"
+                  line = ""
+                  if locs and isinstance(locs, list):
+                      phys = locs[0].get("physicalLocation", {})
+                      file_path = html.escape(str(phys.get("artifactLocation", {}).get("uri", "N/A")))
+                      line = phys.get("region", {}).get("startLine", "")
+                  loc_str = f"{file_path}:{line}" if line else file_path
+                  badge_color = "#dc3545" if level == "error" else ("#fd7e14" if level == "warning" else "#0dcaf0")
+                  rows.append(f"<tr><td><b>{html.escape(tool)}</b></td><td><span style='background:{badge_color};color:white;padding:2px 6px;border-radius:4px;font-size:12px;'>{level.upper()}</span></td><td><code>{rule_id}</code></td><td>{loc_str}</td><td>{msg}</td></tr>")
+
+          html_content = f"""<!DOCTYPE html>
+          <html lang="es"><head><meta charset="UTF-8"><title>Informe DevSecOps - WebGoat</title>
+          <style>
+          body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 20px; background: #f8f9fa; }}
+          h1 {{ color: #212529; }}
+          .summary {{ display: flex; gap: 15px; margin-bottom: 20px; }}
+          .card {{ background: white; padding: 15px 25px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
+          table {{ width: 100%; border-collapse: collapse; background: white; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
+          th, td {{ padding: 10px; border-bottom: 1px solid #dee2e6; text-align: left; font-size: 13px; vertical-align: top; }}
+          th {{ background: #343a40; color: white; position: sticky; top: 0; }}
+          tr:hover {{ background: #f1f3f5; }}
+          </style></head><body>
+          <h1>Informe Consolidado de Seguridad - WebGoat</h1>
+          <div class="summary">
+            <div class="card"><b>Total Hallazgos:</b> {len(rows)}</div>
+            <div class="card" style="border-left: 4px solid #dc3545;"><b>High / Critical (Error):</b> {counts.get("error", 0)}</div>
+            <div class="card" style="border-left: 4px solid #fd7e14;"><b>Medium (Warning):</b> {counts.get("warning", 0)}</div>
+            <div class="card" style="border-left: 4px solid #0dcaf0;"><b>Low / Info (Note):</b> {counts.get("note", 0)}</div>
+          </div>
+          <table><thead><tr><th>Herramienta</th><th>Severidad</th><th>Regla / CVE</th><th>Archivo y Línea</th><th>Descripción</th></tr></thead>
+          <tbody>{"".join(rows)}</tbody></table></body></html>"""
+
+          with open("final-report/security-report.html", "w", encoding="utf-8") as out:
+              out.write(html_content)
+          print(f"HTML generado con exito: {len(rows)} hallazgos.")
+          EOF
+
+          python3 make_html.py
 
       - name: Subir Informe Final Descargable
         uses: actions/upload-artifact@v4
         with:
           name: Informe-Seguridad-WebGoat
           path: |
-            consolidated.sarif
-            security-report.html
-
+            final-report/consolidated.sarif
+            final-report/security-report.html
